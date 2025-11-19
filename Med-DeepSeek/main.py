@@ -6,90 +6,40 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import httpx
 from dotenv import load_dotenv
+from pathlib import Path
 
-# 读取 .env
-load_dotenv()
+from db import engine, Base
+import models  # 确保 ORM 模型注册到 Base
+from session_store import SQLiteSessionStore
 
-# ========= 从 .env 中读取 Azure AI Foundry 配置 =========
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")  # 例如: https://med-deepseek-resource.openai.azure.com/openai/v1
+
+# ========= 显式加载当前目录下的 .env =========
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_MODEL = os.getenv("AZURE_OPENAI_MODEL")        # 例如: deepseek-v3
+AZURE_OPENAI_MODEL = os.getenv("AZURE_OPENAI_MODEL")
 
 if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY and AZURE_OPENAI_MODEL):
     raise RuntimeError(
         "请在 .env 中配置 AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_MODEL"
     )
 
-# 去掉尾部多余的斜杠，防止拼出 //chat/completions
 AZURE_OPENAI_ENDPOINT = AZURE_OPENAI_ENDPOINT.rstrip("/")
 
-# ========= System Prompt（问诊规范 + JSON 输出要求） =========
+# ========= 从单独文件加载 System Prompt =========
+PROMPT_PATH = BASE_DIR / "system_prompt_medical_zh.txt"
+with open(PROMPT_PATH, "r", encoding="utf-8") as f:
+    SYSTEM_PROMPT = f.read()
 
-SYSTEM_PROMPT = """
-你是一个面向普通用户的中文智能医疗分诊助手，擅长根据患者自述症状给出【风险评估、就医紧急程度和基础健康建议】。
+# ========= 初始化数据库表 =========
+Base.metadata.create_all(bind=engine)
 
-【重要原则】：
-1. 你不是医生，不能做出“确诊”，只能给出“可能的情况”和“建议尽快就医”。
-2. 不能开具处方、不能给出详细剂量（例如：具体多少毫克、几片、多久一次），可以给出药物类别级别的建议（如“解热镇痛药”“生理盐水冲洗”等）。
-3. 对明显高危情况（如：胸痛、呼吸困难、持续抽搐、意识模糊、大出血、自杀念头、高烧不退且精神差、严重外伤等），一定要优先提醒用户立刻线下或急诊就医。
-4. 可能涉及隐私和敏感内容时，要提醒用户避免透露真实姓名、身份证号、详细地址等个人信息。
-
-【输入信息】：
-- 用户会用自然语言描述自己的症状、持续时间、既往病史等。
-- 可能额外传入患者基本信息（如：年龄、性别、身高体重、基础疾病、用药史、过敏史等）。
-
-【输出格式要求（务必严格遵守）】：
-你必须 只返回 JSON，不要包含任何解释性文字、不要写在代码块里，不要带前后缀。
-JSON 结构如下（字段名必须一致）：
-
-{
-  "answer": "用日常口语、易懂的方式，给用户的一段整体回复，建议控制在 300-600 字左右。",
-  "triage_level": "emergency | urgent | non_urgent | self_care",
-  "possible_diagnoses": [
-    {
-      "name": "可能的疾病或问题名称（例如：急性胃肠炎，上呼吸道感染，偏头痛等，不能写“确诊”）",
-      "probability": 0.6
-    }
-  ],
-  "suggestions": [
-    "3-6 条具体可执行的建议，例如是否需要线下就诊、建议挂什么科、在家可以做的对症处理注意事项等。"
-  ],
-  "red_flags": [
-    "列出 0-5 条需要特别注意的“危险信号”（如症状加重、出现哪些新症状时要立刻就医）。如果没有可留空数组。"
-  ],
-  "follow_up_questions": [
-    "2-5 个为了进一步判断而希望向用户追问的关键问题（例如：症状持续多久、有没有发烧、是否有基础病等）。"
-  ],
-  "disclaimer": "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。"
-}
-
-【字段含义说明】：
-- triage_level 取值说明：
-  - "emergency": 可能存在严重或危及生命的情况，建议立刻急诊或拨打当地急救电话。
-  - "urgent": 建议尽快（通常 24 小时内）到线下就诊。
-  - "non_urgent": 需要就医，但一般可以在几天内安排普通门诊。
-  - "self_care": 暂时可以在家观察和简单处理，但要结合 red_flags 提醒何时需要就医。
-- possible_diagnoses：
-  - 最多给出 3-5 个；
-  - probability 为 0~1 之间的小数，代表“相对可能性”，总和不必严格等于 1。
-  - 描述时避免绝对化用语（例如用“可能”“倾向于”而不是“就是”“一定是”）。
-- suggestions：
-  - 建议包括：是否、何时需要就医，建议就诊科室（例如：内科、儿科、皮肤科、急诊等），以及在家可尝试的护理措施和注意事项。
-- red_flags：
-  - 如果当前就已经符合急诊指征，也要在这里重复提示，并与 triage_level 保持一致。
-- follow_up_questions：
-  - 用以引导用户补充更关键信息，有助于下一轮回答更准确。
-
-【安全与合规要求】：
-1. 对于用户要求“帮我确诊”“一定是什么病”“给我具体药名和剂量”的请求，要在 answer 中明确说明你不能做确诊或给具体处方剂量。
-2. 对于明显需要急诊的情况，即便用户没有主动要求，你也要在 answer 和 red_flags 中主动提醒，并设置 triage_level = "emergency"。
-3. 需要鼓励用户寻求线下专业帮助，尤其是孕妇、儿童、老年人、多基础疾病人群或症状持续时间较长者。
-
-【格式检查】：
-- 不要输出注释，不要输出多余的字段。
-- 不要在 JSON 外多写任何文字（包括“下面是 JSON”之类的说明）。
-- 如果对信息严重不足无法判断，也要照样输出完整的 JSON，只是在各字段中说明“信息不足，需要补充 xxx”。
-"""
+# ========= 初始化会话存储 =========
+session_store = SQLiteSessionStore()
+MAX_HISTORY_TURNS = 10  # 最多保留 10 轮（user+assistant 共 20 条）
 
 
 # ========= Pydantic 数据模型 =========
@@ -111,7 +61,7 @@ class ChatMessage(BaseModel):
 class ConsultRequest(BaseModel):
     user_id: Optional[str] = None
     query: str = Field(..., description="本轮用户的主诉/问题")
-    history: List[ChatMessage] = Field(default_factory=list, description="历史对话，用于多轮问诊")
+    history: List[ChatMessage] = Field(default_factory=list, description="历史对话（目前后端不依赖前端传）")
     patient_profile: Optional[PatientProfile] = None
 
 
@@ -127,12 +77,13 @@ class ConsultResponse(BaseModel):
     suggestions: List[str]
     red_flags: List[str]
     follow_up_questions: List[str]
+    context_summary: Optional[str] = ""  # 给默认值，防止模型漏字段时报错
     disclaimer: str
 
 
 # ========= FastAPI App =========
 
-app = FastAPI(title="Medical Triage API", version="0.1.0")
+app = FastAPI(title="Medical Triage API", version="0.2.0")
 
 
 def build_system_context(profile: Optional[PatientProfile]) -> str:
@@ -160,26 +111,23 @@ def build_system_context(profile: Optional[PatientProfile]) -> str:
 
 
 def apply_safety_guard(parsed: Dict[str, Any], user_query: str) -> Dict[str, Any]:
-    """
-    安全兜底：根据关键词强制提升急诊等级；同时修正 triage_level 异常值。
-    """
     emergency_keywords = [
         "胸痛", "胸口疼", "胸闷", "呼吸困难", "喘不过气", "大出血", "喷射状呕吐",
         "昏迷", "意识不清", "抽搐", "癫痫", "自杀", "想死", "跳楼",
         "高烧不退", "39度以上", "40度", "心梗", "中风", "半身无力"
     ]
 
-    text = (user_query or "") + " " + (parsed.get("answer") or "")
+    text = user_query or ""
     is_emergency = any(k in text for k in emergency_keywords)
 
     triage = parsed.get("triage_level", "unknown")
-    if triage not in ["emergency", "urgent", "non_urgent", "self_care"]:
+    if triage not in ["emergency", "urgent", "non_urgent", "self_care", "unknown"]:
         triage = "unknown"
 
     if is_emergency:
         triage = "emergency"
         red_flags = parsed.get("red_flags") or []
-        red_flags.append("根据症状描述，存在可能危及生命的风险，建议立刻前往急诊或拨打当地急救电话。")
+        red_flags.append("根据您描述的症状，存在可能危及生命的风险，建议立刻前往急诊或拨打当地急救电话。")
         parsed["red_flags"] = red_flags
 
     parsed["triage_level"] = triage
@@ -190,31 +138,31 @@ def apply_safety_guard(parsed: Dict[str, Any], user_query: str) -> Dict[str, Any
 async def consult(req: ConsultRequest):
     """
     核心问诊接口：
-    - 输入：query + history + patient_profile
-    - 输出：结构化 JSON（由 DeepSeek 生成，后端加一层安全兜底）
+    - 基于 user_id 的多轮对话：后端自动维护历史（SQLite 持久化）
     """
-    # 1. 组装 messages
+    if not req.user_id:
+        raise HTTPException(status_code=400, detail="user_id 不能为空，用于区分会话。")
+
+    # 1. 构造 system 提示词（含患者基础信息）
     system_content = build_system_context(req.patient_profile)
 
+    # 2. 从持久化存储中读取历史对话
+    session_history = session_store.get_history(req.user_id)
+
+    # 3. 组装 messages：System + 历史 + 当前用户消息
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_content},
     ]
-
-    for msg in req.history:
-        messages.append({"role": msg.role, "content": msg.content})
-
+    messages.extend(session_history)
     messages.append({"role": "user", "content": req.query})
 
-    # 2. 调用 Azure AI Foundry 的 openai/v1/chat/completions
+    # 4. 调用 Azure AI Foundry
     url = f"{AZURE_OPENAI_ENDPOINT}/chat/completions"
-
     headers = {
         "Content-Type": "application/json",
-        # Foundry 通常支持 api-key 头；部分环境也接受 Bearer，这里两个都带上
         "api-key": AZURE_OPENAI_API_KEY,
         "Authorization": f"Bearer {AZURE_OPENAI_API_KEY}",
     }
-
     payload = {
         "model": AZURE_OPENAI_MODEL,
         "messages": messages,
@@ -230,13 +178,12 @@ async def consult(req: ConsultRequest):
         raise HTTPException(status_code=502, detail=f"调用模型失败: {str(e)}")
 
     data = resp.json()
-
     try:
         model_text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
         raise HTTPException(status_code=500, detail=f"模型返回格式异常: {str(e)}")
 
-    # 3. 模型返回内容解析为 JSON
+    # 5. 解析模型返回的 JSON
     try:
         parsed = json.loads(model_text)
     except json.JSONDecodeError:
@@ -247,23 +194,53 @@ async def consult(req: ConsultRequest):
             "suggestions": [],
             "red_flags": [],
             "follow_up_questions": [],
+            "context_summary": "",
             "disclaimer": "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。"
         }
 
-    # 4. 安全兜底逻辑
+    # 6. 安全兜底逻辑（关键词 → 强制提升 triage）
     parsed = apply_safety_guard(parsed, user_query=req.query)
 
-    # 5. 补齐缺失字段，适配 ConsultResponse
+    # 7. 补齐字段
     parsed.setdefault("possible_diagnoses", [])
     parsed.setdefault("suggestions", [])
     parsed.setdefault("red_flags", [])
     parsed.setdefault("follow_up_questions", [])
+    parsed.setdefault("context_summary", "")
     parsed.setdefault(
         "disclaimer",
         "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。"
     )
-
     if parsed.get("triage_level") not in ["emergency", "urgent", "non_urgent", "self_care", "unknown"]:
         parsed["triage_level"] = "unknown"
 
+    # 8. 把当前这一轮写入会话历史（只存“对话内容”，方便下一轮）
+    history = session_history or []
+    history.append({"role": "user", "content": req.query})
+    history.append({"role": "assistant", "content": parsed["answer"]})
+
+    # 控制历史长度，防止无限增长
+    if len(history) > MAX_HISTORY_TURNS * 2:
+        history = history[-MAX_HISTORY_TURNS * 2 :]
+
+    # 写回持久化存储
+    session_store.save_history(req.user_id, history)
+
     return parsed
+
+
+@app.get("/api/session_status")
+def session_status(user_id: str):
+    """
+    查询某个 user_id 的会话状态（是否存在、是否过期、历史条数等）
+    """
+    return session_store.get_status(user_id)
+
+
+@app.post("/api/reset_session")
+def reset_session(user_id: str):
+    """
+    清空某个 user_id 的会话历史。
+    """
+    session_store.reset_session(user_id)
+    return {"status": "ok", "message": f"session for user_id={user_id} has been reset"}
