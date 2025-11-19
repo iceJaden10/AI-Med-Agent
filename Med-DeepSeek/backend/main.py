@@ -10,7 +10,7 @@ from pathlib import Path
 
 from db import engine, Base
 import models  # 确保 ORM 模型注册到 Base
-from session_store import SQLiteSessionStore
+from session_store import SQLiteSessionStore  # 将来换 Redis 只改这一行即可
 
 
 # ========= 显式加载当前目录下的 .env =========
@@ -39,7 +39,8 @@ Base.metadata.create_all(bind=engine)
 
 # ========= 初始化会话存储 =========
 session_store = SQLiteSessionStore()
-MAX_HISTORY_TURNS = 10  # 最多保留 10 轮（user+assistant 共 20 条）
+MAX_HISTORY_TURNS = 10          # 持久化里最多保留多少轮原始对话
+RECENT_MESSAGE_LIMIT = 8        # 每次调用模型时，最多带多少条历史消息（user/assistant 混合）
 
 
 # ========= Pydantic 数据模型 =========
@@ -77,37 +78,41 @@ class ConsultResponse(BaseModel):
     suggestions: List[str]
     red_flags: List[str]
     follow_up_questions: List[str]
-    context_summary: Optional[str] = ""  # 给默认值，防止模型漏字段时报错
+    context_summary: Optional[str] = ""  # 模型维护的会话摘要
     disclaimer: str
 
 
 # ========= FastAPI App =========
 
-app = FastAPI(title="Medical Triage API", version="0.2.0")
+app = FastAPI(title="Medical Triage API", version="0.3.0")
 
 
-def build_system_context(profile: Optional[PatientProfile]) -> str:
+def build_system_context(profile: Optional[PatientProfile], session_summary: str = "") -> str:
     """
-    把患者档案信息拼进 system 提示词中，提升问诊准确度。
+    把患者档案 + 既往会话摘要 拼进 system 提示词中。
     """
-    if not profile:
-        return SYSTEM_PROMPT
+    lines = [SYSTEM_PROMPT]
 
-    lines = ["\n【患者基础信息】:"]
-    if profile.age is not None:
-        lines.append(f"- 年龄: {profile.age} 岁")
-    if profile.gender:
-        lines.append(f"- 性别: {profile.gender}")
-    if profile.chronic_diseases:
-        lines.append(f"- 慢性疾病: {', '.join(profile.chronic_diseases)}")
-    if profile.allergies:
-        lines.append(f"- 过敏史: {', '.join(profile.allergies)}")
-    if profile.medications:
-        lines.append(f"- 正在使用的药物: {', '.join(profile.medications)}")
-    if profile.extra:
-        lines.append(f"- 其他: {profile.extra}")
+    if profile:
+        lines.append("\n【患者基础信息】:")  # 单独一块
+        if profile.age is not None:
+            lines.append(f"- 年龄: {profile.age} 岁")
+        if profile.gender:
+            lines.append(f"- 性别: {profile.gender}")
+        if profile.chronic_diseases:
+            lines.append(f"- 慢性疾病: {', '.join(profile.chronic_diseases)}")
+        if profile.allergies:
+            lines.append(f"- 过敏史: {', '.join(profile.allergies)}")
+        if profile.medications:
+            lines.append(f"- 正在使用的药物: {', '.join(profile.medications)}")
+        if profile.extra:
+            lines.append(f"- 其他: {profile.extra}")
 
-    return SYSTEM_PROMPT + "\n" + "\n".join(lines)
+    if session_summary:
+        lines.append("\n【既往问诊摘要】（供你参考，不要逐字复述）:")
+        lines.append(session_summary)
+
+    return "\n".join(lines)
 
 
 def apply_safety_guard(parsed: Dict[str, Any], user_query: str) -> Dict[str, Any]:
@@ -137,24 +142,32 @@ def apply_safety_guard(parsed: Dict[str, Any], user_query: str) -> Dict[str, Any
 @app.post("/api/consult", response_model=ConsultResponse)
 async def consult(req: ConsultRequest):
     """
-    核心问诊接口：
-    - 基于 user_id 的多轮对话：后端自动维护历史（SQLite 持久化）
+    核心问诊接口（带自动摘要 + 长对话控制）：
+    - 使用 context_summary 承接长历史
+    - 每次只带最近 RECENT_MESSAGE_LIMIT 条原始对话
     """
     if not req.user_id:
         raise HTTPException(status_code=400, detail="user_id 不能为空，用于区分会话。")
 
-    # 1. 构造 system 提示词（含患者基础信息）
-    system_content = build_system_context(req.patient_profile)
+    # 1. 从存储里读取会话（摘要 + 最近历史）
+    session = session_store.get_session(req.user_id)
+    session_summary: str = session.get("summary", "") or ""
+    session_history: List[Dict[str, str]] = session.get("messages", []) or []
 
-    # 2. 从持久化存储中读取历史对话
-    session_history = session_store.get_history(req.user_id)
+    # 2. 构造 system 提示词（含患者信息 + 既往会话摘要）
+    system_content = build_system_context(req.patient_profile, session_summary)
 
-    # 3. 组装 messages：System + 历史 + 当前用户消息
+    # 3. 控制上下文长度：只带最近 N 条消息
+    if len(session_history) > RECENT_MESSAGE_LIMIT:
+        recent_history = session_history[-RECENT_MESSAGE_LIMIT:]
+    else:
+        recent_history = session_history
+
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_content},
+        *recent_history,
+        {"role": "user", "content": req.query},
     ]
-    messages.extend(session_history)
-    messages.append({"role": "user", "content": req.query})
 
     # 4. 调用 Azure AI Foundry
     url = f"{AZURE_OPENAI_ENDPOINT}/chat/completions"
@@ -198,7 +211,7 @@ async def consult(req: ConsultRequest):
             "disclaimer": "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。"
         }
 
-    # 6. 安全兜底逻辑（关键词 → 强制提升 triage）
+    # 6. 安全兜底逻辑
     parsed = apply_safety_guard(parsed, user_query=req.query)
 
     # 7. 补齐字段
@@ -206,7 +219,7 @@ async def consult(req: ConsultRequest):
     parsed.setdefault("suggestions", [])
     parsed.setdefault("red_flags", [])
     parsed.setdefault("follow_up_questions", [])
-    parsed.setdefault("context_summary", "")
+    parsed.setdefault("context_summary", session_summary)  # 如果模型没给，则沿用旧摘要
     parsed.setdefault(
         "disclaimer",
         "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。"
@@ -214,17 +227,18 @@ async def consult(req: ConsultRequest):
     if parsed.get("triage_level") not in ["emergency", "urgent", "non_urgent", "self_care", "unknown"]:
         parsed["triage_level"] = "unknown"
 
-    # 8. 把当前这一轮写入会话历史（只存“对话内容”，方便下一轮）
-    history = session_history or []
-    history.append({"role": "user", "content": req.query})
-    history.append({"role": "assistant", "content": parsed["answer"]})
+    # 8. 更新会话：摘要 + 原始对话
+    new_summary: str = parsed.get("context_summary") or session_summary
+    new_history = session_history + [
+        {"role": "user", "content": req.query},
+        {"role": "assistant", "content": parsed["answer"]},
+    ]
 
-    # 控制历史长度，防止无限增长
-    if len(history) > MAX_HISTORY_TURNS * 2:
-        history = history[-MAX_HISTORY_TURNS * 2 :]
+    # 控制存储里的原始消息数量（防止 DB 无限涨）
+    if len(new_history) > MAX_HISTORY_TURNS * 2:
+        new_history = new_history[-MAX_HISTORY_TURNS * 2 :]
 
-    # 写回持久化存储
-    session_store.save_history(req.user_id, history)
+    session_store.save_session(req.user_id, new_summary, new_history)
 
     return parsed
 
