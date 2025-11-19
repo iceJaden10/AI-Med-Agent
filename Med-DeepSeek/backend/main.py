@@ -12,6 +12,20 @@ from db import engine, Base
 import models  # 确保 ORM 模型注册到 Base
 from session_store import SQLiteSessionStore  # 将来换 Redis 只改这一行即可
 
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import Response as FastAPIResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Medical Triage API", version="0.3.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # 开发阶段先用 *，确认能通
+    allow_credentials=False,    # 用 * 时不要带 cookie
+    allow_methods=["*"],        # 包括 OPTIONS
+    allow_headers=["*"],
+)
+
 
 # ========= 显式加载当前目录下的 .env =========
 BASE_DIR = Path(__file__).resolve().parent
@@ -139,13 +153,31 @@ def apply_safety_guard(parsed: Dict[str, Any], user_query: str) -> Dict[str, Any
     return parsed
 
 
+@app.options("/api/consult")
+async def options_consult():
+    # 预检请求专用响应
+    return FastAPIResponse(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+
+
 @app.post("/api/consult", response_model=ConsultResponse)
-async def consult(req: ConsultRequest):
+async def consult(req: ConsultRequest, response: Response):
     """
     核心问诊接口（带自动摘要 + 长对话控制）：
     - 使用 context_summary 承接长历史
     - 每次只带最近 RECENT_MESSAGE_LIMIT 条原始对话
     """
+    # 手动添加 CORS 头，确保浏览器可以访问
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+
     if not req.user_id:
         raise HTTPException(status_code=400, detail="user_id 不能为空，用于区分会话。")
 
