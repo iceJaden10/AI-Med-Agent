@@ -1,12 +1,22 @@
 // src/App.tsx
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 
-import { consult } from './api';
+import { consult, resetSession } from './api';
 import type { ChatMessage, ConsultResponse } from './types';
 import { triageLabel, triageColor } from './triage';
 
 const DEFAULT_USER_ID = 'jaden-memory';
+const GREETING_TEXT =
+  '你好，我是你的智能医疗问诊助手。我会根据你描述的症状，给出初步的风险评估和就医建议，但不能替代医院面诊和正规医疗服务。请用中文详细描述你的不适、持续时间和伴随症状。';
+
+// 继续问诊默认问题（用户视角）
+const DEFAULT_FOLLOW_UP_QUESTIONS = [
+  '如果我去医院的话，应该挂哪个科室？',
+  '目前这种情况有没有比较合适的药物或处理方式？',
+  '有哪些情况说明病情在加重，需要立刻去医院或急诊？',
+  '在家休息期间，我需要特别注意些什么？',
+];
 
 function App() {
   const [userId] = useState(DEFAULT_USER_ID);
@@ -14,9 +24,42 @@ function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const lastAssistantMessage = [...messages].reverse().find(m => m.role === 'assistant');
+  // 最近一条带 meta 的助手消息，用于右侧展示
+  const lastAssistantMessage = [...messages].reverse().find(m => m.role === 'assistant' && !!m.meta);
   const lastMeta: ConsultResponse | undefined = lastAssistantMessage?.meta;
 
+  // 页面首次加载时插入问候语
+  useEffect(() => {
+    const greetingMsg: ChatMessage = {
+      id: uuidv4(),
+      role: 'assistant',
+      content: GREETING_TEXT,
+      ts: new Date().toISOString(),
+    };
+    setMessages([greetingMsg]);
+  }, [userId]);
+
+  // 新开聊天：重置前端 & 后端会话
+  async function handleNewChat() {
+    const greetingMsg: ChatMessage = {
+      id: uuidv4(),
+      role: 'assistant',
+      content: GREETING_TEXT,
+      ts: new Date().toISOString(),
+    };
+    setMessages([greetingMsg]);
+    setInput('');
+    setLoading(false);
+
+    try {
+      await resetSession(userId);
+      console.log('Session reset for user:', userId);
+    } catch (err) {
+      console.error('Failed to reset session', err);
+    }
+  }
+
+  // 发送消息
   async function handleSend(customText?: string) {
     const text = (customText ?? input).trim();
     if (!text || loading) return;
@@ -64,13 +107,14 @@ function App() {
   }
 
   function handleFollowUpClick(question: string) {
+    // 用户快速提问
     handleSend(question);
   }
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center">
-      {/* 顶部导航 */}
-      <header className="w-full max-w-4xl px-4 pt-4 pb-2 flex items-center justify-between">
+      {/* 顶部导航：整体宽度保持不变 */}
+      <header className="w-full max-w-6xl px-4 pt-4 pb-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center text-white font-bold">
             医
@@ -82,33 +126,40 @@ function App() {
         </div>
       </header>
 
-      <main className="w-full max-w-4xl px-4 pb-4 flex flex-col gap-3 flex-1">
+      {/* 主体区域：整体宽度保持不变 */}
+      <main className="w-full max-w-6xl px-4 pb-4 flex flex-col gap-3 flex-1">
         {/* 当前风险等级 & 摘要 */}
         <RiskPanel meta={lastMeta} />
 
         {/* 聊天区域 + 诊断&红旗 */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 md:gap-4 flex-1">
-          {/* 左侧：聊天记录 */}
-          <section className="md:col-span-2 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col">
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-3 md:gap-4 flex-1 items-stretch">
+          {/* 左侧：聊天记录 —— 固定高度 + 内部滚动 */}
+          <section
+            className="
+              md:col-span-9 bg-white rounded-xl shadow-sm border border-slate-200
+              flex flex-col md:h-[600px] h-[700px] min-h-0
+            "
+          >
+            {/* 上方提示文案 */}
             <div className="px-4 py-3 border-b border-slate-100 text-sm text-slate-500">
-              请用中文描述你的症状、持续时间、伴随情况。系统不会记录身份证号等敏感信息。
+              请尽量详细描述你的症状、持续时间、伴随情况等。系统不会记录身份证号等敏感信息。
             </div>
-            <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-              {messages.length === 0 && (
-                <div className="text-xs text-slate-400 text-center mt-6">
-                  例如可以输入：「这两天一直咳嗽，还有点低烧」「孩子今天早上开始拉肚子」等。
-                </div>
-              )}
 
+            {/* 消息列表（内部滚动） */}
+            <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-3">
               {messages.map(msg => (
                 <ChatBubble key={msg.id} msg={msg} />
               ))}
             </div>
-            <div className="border-t border-slate-100 px-3 py-2">
-              <div className="flex items-end gap-2">
+
+            {/* 底部输入区 —— 左输入框 / 右按钮上下排列 */}
+            <div className="border-t border-slate-100 px-3 py-3">
+              <div className="flex items-stretch gap-3">
+                {/* 左侧：输入框 */}
                 <textarea
-                  className="flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-slate-50"
-                  rows={2}
+                  className="flex-1 resize-none rounded-lg border border-slate-200 px-4 py-3 text-sm
+                             focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400
+                             bg-white h-[80px]"
                   placeholder="请描述你的症状，例如：这两天一直咳嗽，还有点低烧……"
                   value={input}
                   onChange={e => setInput(e.target.value)}
@@ -120,19 +171,33 @@ function App() {
                   }}
                   disabled={loading}
                 />
-                <button
-                  className="inline-flex items-center justify-center px-4 py-2 rounded-lg text-sm font-medium bg-emerald-500 text-white hover:bg-emerald-600 disabled:bg-slate-300 disabled:cursor-not-allowed"
-                  onClick={() => handleSend()}
-                  disabled={loading || !input.trim()}
-                >
-                  {loading ? '问诊中...' : '发送'}
-                </button>
+
+                {/* 右侧：按钮上下排列 */}
+                <div className="flex flex-col justify-between gap-2">
+                  <button
+                    onClick={handleNewChat}
+                    className="text-xs px-3 py-2 rounded-lg border border-slate-300
+                               text-slate-700 bg-white hover:bg-slate-100 whitespace-nowrap"
+                  >
+                    新开聊天
+                  </button>
+
+                  <button
+                    className="px-4 py-2.5 rounded-lg text-sm font-medium bg-emerald-500 text-white
+                               hover:bg-emerald-600 disabled:bg-slate-300 disabled:cursor-not-allowed
+                               whitespace-nowrap"
+                    onClick={() => handleSend()}
+                    disabled={loading || !input.trim()}
+                  >
+                    {loading ? '问诊中…' : '发送'}
+                  </button>
+                </div>
               </div>
             </div>
           </section>
 
-          {/* 右侧：诊断卡片 + 红旗 + 继续问诊 */}
-          <section className="flex flex-col gap-3">
+          {/* 右侧：诊断卡片 + 红旗 + 继续问诊 —— 占比变小 */}
+          <section className="md:col-span-3 flex flex-col gap-3">
             <DiagnosisPanel meta={lastMeta} />
             <RedFlagsPanel meta={lastMeta} />
             <FollowUpPanel meta={lastMeta} onFollowUpClick={handleFollowUpClick} />
@@ -149,8 +214,10 @@ export default App;
 
 function ChatBubble({ msg }: { msg: ChatMessage }) {
   const isUser = msg.role === 'user';
+  const followUps = !isUser ? msg.meta?.follow_up_questions ?? [] : [];
+
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
       <div
         className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm leading-relaxed shadow-sm ${
           isUser
@@ -160,6 +227,14 @@ function ChatBubble({ msg }: { msg: ChatMessage }) {
       >
         {msg.content}
       </div>
+
+      {/* 助手侧：后端返回的继续问诊问题，作为灰色小字展示在下方 */}
+      {!isUser && followUps.length > 0 && (
+        <div className="mt-1 max-w-[80%] text-[11px] text-slate-400 leading-snug">
+          <span className="font-medium">医生想进一步了解：</span>
+          {followUps.join('；')}
+        </div>
+      )}
     </div>
   );
 }
@@ -266,16 +341,17 @@ function FollowUpPanel({
   meta?: ConsultResponse;
   onFollowUpClick: (q: string) => void;
 }) {
-  if (!meta || !meta.follow_up_questions?.length) return null;
+  // 需要先有一次问诊结果再展示“继续问诊”
+  if (!meta) return null;
 
   return (
     <div className="bg-white border border-slate-200 rounded-xl px-3 py-2 shadow-sm">
       <div className="flex items-center justify-between mb-1.5">
         <div className="text-sm font-medium text-slate-800">继续问诊</div>
-        <span className="text-[11px] text-slate-400">点击下方问题继续回答</span>
+        <span className="text-[11px] text-slate-400">点击下方问题快速提问</span>
       </div>
       <div className="flex flex-wrap gap-1">
-        {meta.follow_up_questions.map((q, i) => (
+        {DEFAULT_FOLLOW_UP_QUESTIONS.map((q, i) => (
           <button
             key={i}
             type="button"
