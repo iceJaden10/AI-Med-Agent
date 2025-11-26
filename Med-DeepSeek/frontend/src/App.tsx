@@ -81,6 +81,7 @@ function App() {
       const res = await consult({
         user_id: userId,
         query: text,
+        provider: 'qwen', // 🔴 显式指定使用 Qwen3-max
       });
 
       const assistantMsg: ChatMessage = {

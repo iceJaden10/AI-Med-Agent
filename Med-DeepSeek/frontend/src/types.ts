@@ -1,4 +1,8 @@
+// src/types.ts
+
 export type TriageLevel = 'emergency' | 'urgent' | 'non_urgent' | 'self_care' | 'unknown';
+
+export type Provider = 'qwen' | 'azure';
 
 export interface PossibleDiagnosis {
   name: string;
@@ -16,17 +20,21 @@ export interface ConsultResponse {
   disclaimer: string;
 }
 
+export interface PatientProfile {
+  age?: number;
+  gender?: string;
+  chronic_diseases?: string[];
+  allergies?: string[];
+  medications?: string[];
+  extra?: Record<string, any>;
+}
+
 export interface ConsultRequest {
   user_id: string;
   query: string;
-  patient_profile?: {
-    age?: number;
-    gender?: string;
-    chronic_diseases?: string[];
-    allergies?: string[];
-    medications?: string[];
-    extra?: Record<string, any>;
-  };
+  /** 可选指定这次用哪个模型，不传则在 api.ts 里默认补成 "qwen" */
+  provider?: Provider;
+  patient_profile?: PatientProfile;
 }
 
 export type ChatRole = 'user' | 'assistant';
@@ -36,5 +44,6 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   ts: string;
-  meta?: ConsultResponse; // 只有 assistant 消息会带
+  /** 只有 assistant 消息会带结构化问诊结果 */
+  meta?: ConsultResponse;
 }

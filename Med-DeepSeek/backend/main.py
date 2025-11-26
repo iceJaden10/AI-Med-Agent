@@ -3,9 +3,11 @@ import json
 from typing import List, Optional, Literal, Dict, Any
 import traceback
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
-import httpx
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response as FastAPIResponse
+
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -13,9 +15,10 @@ from db import engine, Base
 import models  # 确保 ORM 模型注册到 Base
 from session_store import SQLiteSessionStore  # 将来换 Redis 只改这一行即可
 
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import Response as FastAPIResponse
-from fastapi.middleware.cors import CORSMiddleware
+# 统一 LLM 路由（内部再区分 Azure / Qwen3-max）
+from llm_router import chat_with_llm
+import inspect
+
 
 app = FastAPI(title="Medical Triage API", version="0.3.0")
 
@@ -27,24 +30,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ========= 显式加载当前目录下的 .env =========
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_MODEL = os.getenv("AZURE_OPENAI_MODEL")
-
-if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY and AZURE_OPENAI_MODEL):
-    raise RuntimeError(
-        "请在 .env 中配置 AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_MODEL"
-    )
-
-AZURE_OPENAI_ENDPOINT = AZURE_OPENAI_ENDPOINT.rstrip("/")
-
-# ========= 从单独文件加载 System Prompt =========
+# 这里只负责加载 system prompt，不再直接关心 Azure / Qwen 的具体配置
 PROMPT_PATH = BASE_DIR / "system_prompt_medical_zh.txt"
 with open(PROMPT_PATH, "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
@@ -77,8 +68,16 @@ class ChatMessage(BaseModel):
 class ConsultRequest(BaseModel):
     user_id: Optional[str] = None
     query: str = Field(..., description="本轮用户的主诉/问题")
-    history: List[ChatMessage] = Field(default_factory=list, description="历史对话（目前后端不依赖前端传）")
+    history: List[ChatMessage] = Field(
+        default_factory=list,
+        description="历史对话（目前后端不依赖前端传）"
+    )
     patient_profile: Optional[PatientProfile] = None
+    # 新增：可选指定这次用哪个模型提供商（不传则用 .env 中的 LLM_PROVIDER）
+    provider: Optional[str] = Field(
+        default=None,
+        description="可选：'qwen' 或 'azure'，不传则用环境变量 LLM_PROVIDER"
+    )
 
 
 class PossibleDiagnosis(BaseModel):
@@ -96,13 +95,12 @@ class ConsultResponse(BaseModel):
     context_summary: Optional[str] = ""  # 模型维护的会话摘要
     disclaimer: str
 
+
 class ResetSessionRequest(BaseModel):
     user_id: str
 
 
-
-# ========= FastAPI App =========
-
+# ========= 工具函数 =========
 
 def build_system_context(profile: Optional[PatientProfile], session_summary: str = "") -> str:
     """
@@ -156,6 +154,8 @@ def apply_safety_guard(parsed: Dict[str, Any], user_query: str) -> Dict[str, Any
     return parsed
 
 
+# ========= API 路由 =========
+
 @app.options("/api/consult")
 async def options_consult():
     # 预检请求专用响应
@@ -175,6 +175,7 @@ async def consult(req: ConsultRequest, response: Response):
     核心问诊接口（带自动摘要 + 长对话控制）：
     - 使用 context_summary 承接长历史
     - 每次只带最近 RECENT_MESSAGE_LIMIT 条原始对话
+    - 通过 llm_router 决定使用 Azure 还是 Qwen3-max
     """
     # 手动添加 CORS 头，确保浏览器可以访问
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -204,33 +205,33 @@ async def consult(req: ConsultRequest, response: Response):
         {"role": "user", "content": req.query},
     ]
 
-    # 4. 调用 Azure AI Foundry
-    url = f"{AZURE_OPENAI_ENDPOINT}/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "api-key": AZURE_OPENAI_API_KEY,
-        "Authorization": f"Bearer {AZURE_OPENAI_API_KEY}",
-    }
-    payload = {
-        "model": AZURE_OPENAI_MODEL,
-        "messages": messages,
-        "temperature": 0.3,
-        "max_tokens": 1024,
-    }
-
+    # 4. 调用 LLM 路由（内部再决定是 Azure 还是 Qwen3-max）
+    # 兼容你当前的 llm_router.chat_with_llm 签名：
+    #   chat_with_llm(user_query: str, history_messages=None, provider: Optional[str] = None)
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-    except httpx.HTTPError as e:
+        # history_messages 只传最近历史，不包含这轮 user 的 query
+        # 如果你在 llm_router / azure_client / qwen_client 里自己拼 messages，
+        # 这里就只负责把 query + history 传过去即可。
+        result = chat_with_llm(
+            user_query=req.query,
+            history_messages=recent_history,
+            provider=req.provider,  # None 则用 .env 里的 LLM_PROVIDER
+        )
+
+        # 兼容 sync / async 两种写法
+        if inspect.isawaitable(result):
+            result = await result
+
+        # 兼容返回值是 str 或 (str, provider) 两种形式
+        if isinstance(result, tuple):
+            model_text = result[0]
+        else:
+            model_text = result
+
+    except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"调用模型失败: {str(e)}")
 
-    data = resp.json()
-    try:
-        model_text = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        raise HTTPException(status_code=500, detail=f"模型返回格式异常: {str(e)}")
 
     # 5. 解析模型返回的 JSON
     try:
@@ -244,7 +245,7 @@ async def consult(req: ConsultRequest, response: Response):
             "red_flags": [],
             "follow_up_questions": [],
             "context_summary": "",
-            "disclaimer": "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。"
+            "disclaimer": "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。",
         }
 
     # 6. 安全兜底逻辑
@@ -258,7 +259,7 @@ async def consult(req: ConsultRequest, response: Response):
     parsed.setdefault("context_summary", session_summary)  # 如果模型没给，则沿用旧摘要
     parsed.setdefault(
         "disclaimer",
-        "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。"
+        "本回答不能替代医生面诊和正规医疗服务，仅供一般健康信息参考。如症状明显、持续或加重，请尽快前往正规医疗机构就诊或拨打当地急救电话。",
     )
     if parsed.get("triage_level") not in ["emergency", "urgent", "non_urgent", "self_care", "unknown"]:
         parsed["triage_level"] = "unknown"
@@ -292,7 +293,6 @@ def reset_session(req: ResetSessionRequest, response: Response):
     """
     清空某个 user_id 的会话历史（用于“新开聊天”）。
     """
-    # 可选：手动加一层 CORS 头（即使有全局 CORSMiddleware，也无伤大雅）
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
@@ -300,5 +300,5 @@ def reset_session(req: ResetSessionRequest, response: Response):
     session_store.reset_session(req.user_id)
     return {
         "status": "ok",
-        "message": f"session for user_id={req.user_id} has been reset"
+        "message": f"session for user_id={req.user_id} has been reset",
     }
