@@ -1,6 +1,7 @@
 import os
 import json
 from typing import List, Optional, Literal, Dict, Any
+import traceback
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -95,10 +96,12 @@ class ConsultResponse(BaseModel):
     context_summary: Optional[str] = ""  # 模型维护的会话摘要
     disclaimer: str
 
+class ResetSessionRequest(BaseModel):
+    user_id: str
+
+
 
 # ========= FastAPI App =========
-
-app = FastAPI(title="Medical Triage API", version="0.3.0")
 
 
 def build_system_context(profile: Optional[PatientProfile], session_summary: str = "") -> str:
@@ -220,6 +223,7 @@ async def consult(req: ConsultRequest, response: Response):
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
     except httpx.HTTPError as e:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"调用模型失败: {str(e)}")
 
     data = resp.json()
@@ -284,9 +288,17 @@ def session_status(user_id: str):
 
 
 @app.post("/api/reset_session")
-def reset_session(user_id: str):
+def reset_session(req: ResetSessionRequest, response: Response):
     """
-    清空某个 user_id 的会话历史。
+    清空某个 user_id 的会话历史（用于“新开聊天”）。
     """
-    session_store.reset_session(user_id)
-    return {"status": "ok", "message": f"session for user_id={user_id} has been reset"}
+    # 可选：手动加一层 CORS 头（即使有全局 CORSMiddleware，也无伤大雅）
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+
+    session_store.reset_session(req.user_id)
+    return {
+        "status": "ok",
+        "message": f"session for user_id={req.user_id} has been reset"
+    }
