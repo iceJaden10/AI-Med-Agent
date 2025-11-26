@@ -6,7 +6,6 @@ import { consult, resetSession } from './api';
 import type { ChatMessage, ConsultResponse } from './types';
 import { triageLabel, triageColor } from './triage';
 
-const DEFAULT_USER_ID = 'jaden-memory';
 const GREETING_TEXT =
   '你好，我是你的智能医疗问诊助手。我会根据你描述的症状，给出初步的风险评估和就医建议，但不能替代医院面诊和正规医疗服务。请用中文详细描述你的不适、持续时间和伴随症状。';
 
@@ -19,7 +18,9 @@ const DEFAULT_FOLLOW_UP_QUESTIONS = [
 ];
 
 function App() {
-  const [userId] = useState(DEFAULT_USER_ID);
+  // ✅ 每次打开 / 刷新页面都会生成一个全新的 userId（不落盘，不共享）
+  const [userId] = useState(() => uuidv4());
+
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -39,7 +40,7 @@ function App() {
     setMessages([greetingMsg]);
   }, [userId]);
 
-  // 新开聊天：重置前端 & 后端会话
+  // 新开聊天：重置前端 & 后端会话（保留当前页面的 userId，只清历史）
   async function handleNewChat() {
     const greetingMsg: ChatMessage = {
       id: uuidv4(),
@@ -81,7 +82,7 @@ function App() {
       const res = await consult({
         user_id: userId,
         query: text,
-        provider: 'qwen', // 🔴 显式指定使用 Qwen3-max
+        provider: 'qwen', // 显式指定使用 Qwen3-max
       });
 
       const assistantMsg: ChatMessage = {

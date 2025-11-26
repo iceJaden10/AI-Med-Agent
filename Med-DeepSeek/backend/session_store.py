@@ -1,7 +1,7 @@
 # session_store.py
 import json
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -18,7 +18,7 @@ except ImportError:
 class SQLiteSessionStore:
     """
     SQLite 会话存储：
-    - history_json 里统一存：{"summary": "...", "messages": [...]}
+    - history_json 里统一存：{"summary": "...", "messages": [...], "updated_at": "..."}
     - 兼容旧数据（直接存的是 list）
     - 带 TTL 自动过期
     """
@@ -38,32 +38,53 @@ class SQLiteSessionStore:
     def _decode_history_json(self, history_json: str) -> Dict[str, Any]:
         """
         统一解析为：
-        {"summary": str, "messages": List[dict]}
+        {
+          "summary": str,
+          "messages": List[dict],
+          "updated_at": str | None
+        }
         """
         if not history_json:
-            return {"summary": "", "messages": []}
+            return {"summary": "", "messages": [], "updated_at": None}
 
         try:
             data = json.loads(history_json)
         except json.JSONDecodeError:
-            return {"summary": "", "messages": []}
+            return {"summary": "", "messages": [], "updated_at": None}
 
         # 旧格式：直接是 list
         if isinstance(data, list):
-            return {"summary": "", "messages": data}
+            return {"summary": "", "messages": data, "updated_at": None}
 
         # 新格式：dict
-        summary = data.get("summary", "") if isinstance(data, dict) else ""
-        messages = data.get("messages", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict):
+            return {"summary": "", "messages": [], "updated_at": None}
+
+        summary = data.get("summary", "") or ""
+        messages = data.get("messages", []) or []
         if not isinstance(messages, list):
             messages = []
-        return {"summary": summary, "messages": messages}
 
-    def _encode_history_json(self, summary: str, messages: List[Dict[str, str]]) -> str:
-        payload = {
+        updated_at = data.get("updated_at")  # 可能不存在，兼容旧数据
+
+        return {
+            "summary": summary,
+            "messages": messages,
+            "updated_at": updated_at,
+        }
+
+    def _encode_history_json(
+        self,
+        summary: str,
+        messages: List[Dict[str, str]],
+        updated_at: Optional[datetime] = None,
+    ) -> str:
+        payload: Dict[str, Any] = {
             "summary": summary or "",
             "messages": messages or [],
         }
+        if updated_at is not None:
+            payload["updated_at"] = updated_at.isoformat()
         return json.dumps(payload, ensure_ascii=False)
 
     # ---------- 对外接口：session 级别 ----------
@@ -73,22 +94,28 @@ class SQLiteSessionStore:
         返回：
         {
           "summary": str,      # 全局会话摘要（可为空字符串）
-          "messages": [ ... ]  # 最近若干轮对话
+          "messages": [ ... ], # 最近若干轮对话
+          "updated_at": str | None
         }
         """
         db = self._get_db()
         try:
             row = db.query(ConversationSession).filter_by(user_id=user_id).first()
             if not row:
-                return {"summary": "", "messages": []}
+                return {"summary": "", "messages": [], "updated_at": None}
 
             ttl = row.ttl_seconds or self.ttl_seconds
             if self._is_expired(row.updated_at, ttl):
                 db.delete(row)
                 db.commit()
-                return {"summary": "", "messages": []}
+                return {"summary": "", "messages": [], "updated_at": None}
 
             decoded = self._decode_history_json(row.history_json)
+
+            # 如果 JSON 里没有 updated_at 字段，用行里的 updated_at 补上
+            if not decoded.get("updated_at"):
+                decoded["updated_at"] = row.updated_at.isoformat()
+
             return decoded
         finally:
             db.close()
@@ -101,7 +128,7 @@ class SQLiteSessionStore:
         try:
             row = db.query(ConversationSession).filter_by(user_id=user_id).first()
             now = datetime.utcnow()
-            encoded = self._encode_history_json(summary, messages)
+            encoded = self._encode_history_json(summary, messages, now)
 
             if not row:
                 row = ConversationSession(
@@ -184,7 +211,7 @@ class RedisSessionStore:
     """
     Redis 会话存储（为未来云端扩容准备）：
     - key: session:{user_id}
-    - value: {"summary": "...", "messages": [...]}
+    - value: {"summary": "...", "messages": [...], "updated_at": "..."}
     - 利用 Redis 自身的 TTL 过期
     """
     DEFAULT_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -203,26 +230,32 @@ class RedisSessionStore:
     def get_session(self, user_id: str) -> Dict[str, Any]:
         data = self.client.get(self._key(user_id))
         if not data:
-            return {"summary": "", "messages": []}
+            return {"summary": "", "messages": [], "updated_at": None}
 
         try:
             payload = json.loads(data)
         except json.JSONDecodeError:
-            return {"summary": "", "messages": []}
+            return {"summary": "", "messages": [], "updated_at": None}
 
         # 兼容 list 格式
         if isinstance(payload, list):
-            return {"summary": "", "messages": payload}
+            return {"summary": "", "messages": payload, "updated_at": None}
 
         if not isinstance(payload, dict):
-            return {"summary": "", "messages": []}
+            return {"summary": "", "messages": [], "updated_at": None}
 
         summary = payload.get("summary", "") or ""
         messages = payload.get("messages", []) or []
         if not isinstance(messages, list):
             messages = []
 
-        return {"summary": summary, "messages": messages}
+        updated_at = payload.get("updated_at")
+
+        return {
+            "summary": summary,
+            "messages": messages,
+            "updated_at": updated_at,
+        }
 
     def save_session(self, user_id: str, summary: str, messages: List[Dict[str, str]]) -> None:
         payload = {
