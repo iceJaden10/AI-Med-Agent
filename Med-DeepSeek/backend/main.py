@@ -1,6 +1,7 @@
 import os
 import json
 from typing import List, Optional, Literal, Dict, Any
+import traceback
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -222,6 +223,7 @@ async def consult(req: ConsultRequest, response: Response):
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
     except httpx.HTTPError as e:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"调用模型失败: {str(e)}")
 
     data = resp.json()
