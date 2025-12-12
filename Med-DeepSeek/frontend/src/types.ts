@@ -35,9 +35,19 @@ export interface ConsultRequest {
   /** 可选指定这次用哪个模型，不传则在 api.ts 里默认补成 "qwen" */
   provider?: Provider;
   patient_profile?: PatientProfile;
+  /** 前端上传的图片，先传给后端做多模态问诊 */
+  image_base64?: string;
+  image_mime_type?: string;
+  image_name?: string;
+  lang?: 'zh' | 'en';
 }
 
 export type ChatRole = 'user' | 'assistant';
+
+export interface ImageAttachment {
+  previewUrl: string;
+  name?: string;
+}
 
 export interface ChatMessage {
   id: string;
@@ -46,4 +56,5 @@ export interface ChatMessage {
   ts: string;
   /** 只有 assistant 消息会带结构化问诊结果 */
   meta?: ConsultResponse;
+  image?: ImageAttachment;
 }

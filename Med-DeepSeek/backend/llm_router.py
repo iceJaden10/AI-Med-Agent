@@ -1,4 +1,3 @@
-# backend/llm_router.py
 import os
 from typing import Literal, Optional
 
@@ -16,26 +15,34 @@ def normalize_provider(provider: Optional[str]) -> ProviderType:
         return "azure"
     if p in ("qwen", "qwen3", "qwen3-max", "ali", "aliyun"):
         return "qwen"
-    return "qwen"   # 不识别时默认 Qwen
+    return "qwen"
 
 
 def chat_with_llm(
     user_query: str,
     history_messages=None,
     provider: Optional[str] = None,
+    image_data_url: Optional[str] = None,
+    image_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,   # ✅ 新增
 ) -> tuple[str, ProviderType]:
-    """
-    返回：(answer, actual_provider)
-    provider:
-      - None: 使用 .env 的 LLM_PROVIDER
-      - "azure": 强制 Azure
-      - "qwen":  强制 Qwen3-max
-    """
     p = normalize_provider(provider)
 
     if p == "azure":
-        answer = call_azure_llm(user_query, history_messages)
+        if image_data_url:
+            user_query = (
+                f"{user_query}\n\n"
+                "[User uploaded an image for reference, but the current model does not support image input. "
+                "Please answer based on text only.]"
+            )
+        answer = call_azure_llm(user_query, history_messages, system_prompt=system_prompt)
     else:
-        answer = call_qwen3_max(user_query, history_messages)
+        answer = call_qwen3_max(
+            user_query,
+            history_messages,
+            image_data_url=image_data_url,
+            image_name=image_name,
+            system_prompt=system_prompt,
+        )
 
     return answer, p
