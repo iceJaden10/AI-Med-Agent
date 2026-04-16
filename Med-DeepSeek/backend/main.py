@@ -1,4 +1,5 @@
 import json
+import re
 import traceback
 import inspect
 from pathlib import Path
@@ -366,6 +367,41 @@ def ensure_schema(parsed: Dict[str, Any], lang: Literal["zh", "en"], session_sum
     return parsed
 
 
+def try_parse_model_json(model_text: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(model_text, dict):
+        return model_text
+
+    if not isinstance(model_text, str):
+        return None
+
+    text = model_text.strip()
+    if not text:
+        return None
+
+    candidates: List[str] = [text]
+
+    fenced_match = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", text, flags=re.IGNORECASE)
+    if fenced_match:
+        candidates.insert(0, fenced_match.group(1).strip())
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        candidates.append(text[start:end + 1].strip())
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(parsed, dict):
+            return parsed
+
+    print("Failed to parse model JSON response:", repr(text[:1000]))
+    return None
+
+
 # =========================
 # Routes
 # =========================
@@ -458,9 +494,8 @@ async def consult(req: ConsultRequest, response: Response):
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"调用模型失败: {str(e)}")
 
-    try:
-        parsed = json.loads(model_text)
-    except json.JSONDecodeError:
+    parsed = try_parse_model_json(model_text)
+    if parsed is None:
         parsed = PARSE_FALLBACK_EN.copy() if lang == "en" else PARSE_FALLBACK_ZH.copy()
 
     parsed = apply_safety_guard(parsed, user_query=req.query, lang=lang)

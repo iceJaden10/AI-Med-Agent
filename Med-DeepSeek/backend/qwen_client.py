@@ -75,6 +75,7 @@ def call_qwen3_max(
     resp = qwen_client.chat.completions.create(
         model=QWEN_MODEL_NAME,
         messages=messages,
+        response_format={"type": "json_object"},
         temperature=temperature,
         max_tokens=max_tokens,
     )
