@@ -1,5 +1,3 @@
-// src/types.ts
-
 export type TriageLevel = 'emergency' | 'urgent' | 'non_urgent' | 'self_care' | 'unknown';
 
 export type Provider = 'qwen' | 'azure';
@@ -23,6 +21,8 @@ export interface ConsultResponse {
 export interface PatientProfile {
   age?: number;
   gender?: string;
+  height_cm?: number;
+  weight_kg?: number;
   chronic_diseases?: string[];
   allergies?: string[];
   medications?: string[];
@@ -32,10 +32,8 @@ export interface PatientProfile {
 export interface ConsultRequest {
   user_id: string;
   query: string;
-  /** 可选指定这次用哪个模型，不传则在 api.ts 里默认补成 "qwen" */
   provider?: Provider;
   patient_profile?: PatientProfile;
-  /** 前端上传的图片，先传给后端做多模态问诊 */
   image_base64?: string;
   image_mime_type?: string;
   image_name?: string;
@@ -54,7 +52,6 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   ts: string;
-  /** 只有 assistant 消息会带结构化问诊结果 */
   meta?: ConsultResponse;
   image?: ImageAttachment;
 }

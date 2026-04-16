@@ -1,10 +1,9 @@
-// src/App.tsx
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 
-import { consult, resetSession } from './api';
-import type { ChatMessage, ConsultResponse } from './types';
+import { consult, getProfile, resetSession, saveProfile } from './api';
+import type { ChatMessage, ConsultResponse, PatientProfile } from './types';
 import { triageColor } from './triage';
 import { I18N, type Lang } from './i18n';
 
@@ -25,8 +24,33 @@ function safeSetLang(lang: Lang) {
   }
 }
 
+function safeGetUserId(): string {
+  try {
+    const saved = localStorage.getItem('med_user_id');
+    if (saved) return saved;
+    const id = uuidv4();
+    localStorage.setItem('med_user_id', id);
+    return id;
+  } catch {
+    return uuidv4();
+  }
+}
+
+function splitToList(input: string): string[] {
+  return input
+    .split(/[，,、；;]/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function joinList(list?: string[]): string {
+  return (list ?? []).join(', ');
+}
+
+const PROFILE_MODAL_CLOSE_MS = 200;
+
 export default function App() {
-  const [userId] = useState(() => uuidv4());
+  const [userId] = useState(() => safeGetUserId());
 
   const [lang, setLang] = useState<Lang>(() => safeGetLang());
   const t = I18N[lang];
@@ -42,6 +66,21 @@ export default function App() {
   const [pendingImage, setPendingImage] = useState<{ file: File; dataUrl: string } | null>(null);
   const [uploadError, setUploadError] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const profileCloseTimerRef = useRef<number | null>(null);
+
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileClosing, setProfileClosing] = useState(false);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [patientProfile, setPatientProfile] = useState<PatientProfile>({});
+  const [profileForm, setProfileForm] = useState({
+    age: '',
+    gender: '',
+    height_cm: '',
+    weight_kg: '',
+    chronic_diseases: '',
+    allergies: '',
+  });
 
   const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
 
@@ -53,7 +92,19 @@ export default function App() {
     return t.triage?.[key] ?? key;
   }
 
-  // 初次进入：插入问候语
+  function syncFormFromProfile(profile: PatientProfile | null) {
+    const p = profile ?? {};
+    setPatientProfile(p);
+    setProfileForm({
+      age: p.age != null ? String(p.age) : '',
+      gender: p.gender ?? '',
+      height_cm: p.height_cm != null ? String(p.height_cm) : '',
+      weight_kg: p.weight_kg != null ? String(p.weight_kg) : '',
+      chronic_diseases: joinList(p.chronic_diseases),
+      allergies: joinList(p.allergies),
+    });
+  }
+
   useEffect(() => {
     const greetingMsg: ChatMessage = {
       id: uuidv4(),
@@ -65,7 +116,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 
-  // 切换语言：更新第一条问候语（仅当第一条是 assistant 时）
   useEffect(() => {
     setMessages(prev => {
       if (!prev.length) return prev;
@@ -74,6 +124,59 @@ export default function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lang]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadProfile() {
+      setProfileLoading(true);
+      try {
+        const profile = await getProfile(userId);
+        if (!cancelled) syncFormFromProfile(profile);
+      } catch (err) {
+        console.error(err);
+        if (!cancelled) syncFormFromProfile(null);
+      } finally {
+        if (!cancelled) setProfileLoading(false);
+      }
+    }
+
+    loadProfile();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  useEffect(() => {
+    return () => {
+      if (profileCloseTimerRef.current != null) {
+        window.clearTimeout(profileCloseTimerRef.current);
+      }
+    };
+  }, []);
+
+  function openProfileModal() {
+    if (profileCloseTimerRef.current != null) {
+      window.clearTimeout(profileCloseTimerRef.current);
+      profileCloseTimerRef.current = null;
+    }
+    setProfileClosing(false);
+    setProfileOpen(true);
+  }
+
+  function closeProfileModal() {
+    if (!profileOpen) return;
+    if (profileCloseTimerRef.current != null) {
+      window.clearTimeout(profileCloseTimerRef.current);
+    }
+
+    setProfileClosing(true);
+    profileCloseTimerRef.current = window.setTimeout(() => {
+      setProfileOpen(false);
+      setProfileClosing(false);
+      profileCloseTimerRef.current = null;
+    }, PROFILE_MODAL_CLOSE_MS);
+  }
 
   async function handleNewChat() {
     const greetingMsg: ChatMessage = {
@@ -127,6 +230,7 @@ export default function App() {
         query: queryText,
         provider: 'qwen',
         lang,
+        patient_profile: patientProfile,
         image_base64: base64Image,
         image_mime_type: mime,
         image_name: name,
@@ -152,6 +256,48 @@ export default function App() {
       setMessages(prev => [...prev, errMsg]);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleSaveProfile() {
+    const payload: PatientProfile = {
+      age: profileForm.age.trim() ? Number(profileForm.age) : undefined,
+      gender: profileForm.gender.trim() || undefined,
+      height_cm: profileForm.height_cm.trim() ? Number(profileForm.height_cm) : undefined,
+      weight_kg: profileForm.weight_kg.trim() ? Number(profileForm.weight_kg) : undefined,
+      chronic_diseases: splitToList(profileForm.chronic_diseases),
+      allergies: splitToList(profileForm.allergies),
+    };
+
+    if (
+      payload.age != null &&
+      (!Number.isInteger(payload.age) || payload.age <= 0)
+    ) {
+      alert(t.profileSaveFailed);
+      return;
+    }
+
+    if (payload.height_cm != null && Number.isNaN(payload.height_cm)) {
+      alert(t.profileSaveFailed);
+      return;
+    }
+
+    if (payload.weight_kg != null && Number.isNaN(payload.weight_kg)) {
+      alert(t.profileSaveFailed);
+      return;
+    }
+
+    setProfileSaving(true);
+    try {
+      const saved = await saveProfile(userId, payload);
+      setPatientProfile(saved);
+      syncFormFromProfile(saved);
+      closeProfileModal();
+    } catch (err) {
+      console.error(err);
+      alert(t.profileSaveFailed);
+    } finally {
+      setProfileSaving(false);
     }
   }
 
@@ -189,7 +335,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center">
-      {/* Header */}
       <header className="w-full max-w-6xl px-4 pt-4 pb-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center text-white font-bold">
@@ -201,21 +346,29 @@ export default function App() {
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setLang(prev => (prev === 'zh' ? 'en' : 'zh'))}
-          className="text-xs px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-100"
-        >
-          {lang === 'zh' ? 'EN' : '中文'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={openProfileModal}
+            className="text-xs px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-100"
+          >
+            {t.myInfo}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setLang(prev => (prev === 'zh' ? 'en' : 'zh'))}
+            className="text-xs px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-100"
+          >
+            {lang === 'zh' ? 'EN' : '中文'}
+          </button>
+        </div>
       </header>
 
-      {/* Main */}
       <main className="w-full max-w-6xl px-4 pb-4 flex flex-col gap-3 flex-1">
         <RiskPanel meta={lastMeta} t={t} triageLabelLocalized={triageLabelLocalized} />
 
         <div className="grid grid-cols-1 md:grid-cols-12 gap-3 md:gap-4 flex-1 items-stretch">
-          {/* Chat */}
           <section className="md:col-span-9 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col flex-1 min-h-0">
             <div className="px-4 py-3 border-b border-slate-100 text-sm text-slate-500">{t.chatHint}</div>
 
@@ -225,7 +378,6 @@ export default function App() {
               ))}
             </div>
 
-            {/* Composer */}
             <div className="border-t border-slate-100 px-3 py-3">
               <div className="flex flex-col gap-2">
                 <div
@@ -332,7 +484,6 @@ export default function App() {
             </div>
           </section>
 
-          {/* Right panels */}
           <section className="md:col-span-3 flex flex-col gap-3">
             <DiagnosisPanel meta={lastMeta} t={t} />
             <RedFlagsPanel meta={lastMeta} t={t} />
@@ -340,13 +491,180 @@ export default function App() {
           </section>
         </div>
       </main>
+
+      {profileOpen && (
+        <ProfileModal
+          closing={profileClosing}
+          t={t}
+          loading={profileLoading}
+          saving={profileSaving}
+          form={profileForm}
+          onClose={closeProfileModal}
+          onSave={handleSaveProfile}
+          onChange={patch => setProfileForm(prev => ({ ...prev, ...patch }))}
+        />
+      )}
     </div>
   );
 }
 
-/* =======================
-   Components
-======================= */
+function ProfileModal({
+  closing,
+  t,
+  loading,
+  saving,
+  form,
+  onClose,
+  onSave,
+  onChange,
+}: {
+  closing: boolean;
+  t: any;
+  loading: boolean;
+  saving: boolean;
+  form: {
+    age: string;
+    gender: string;
+    height_cm: string;
+    weight_kg: string;
+    chronic_diseases: string;
+    allergies: string;
+  };
+  onClose: () => void;
+  onSave: () => void;
+  onChange: (patch: Partial<{
+    age: string;
+    gender: string;
+    height_cm: string;
+    weight_kg: string;
+    chronic_diseases: string;
+    allergies: string;
+  }>) => void;
+}) {
+  return (
+    <div
+      className={`fixed inset-0 z-50 flex items-center justify-center px-4 transition-opacity duration-200 ${
+        closing ? 'bg-black/0 opacity-0' : 'bg-black/35 opacity-100'
+      }`}
+    >
+      <div
+        className={`w-full max-w-lg overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl transition-all duration-200 ${
+          closing ? 'translate-y-2 scale-95 opacity-0' : 'translate-y-0 scale-100 opacity-100'
+        }`}
+      >
+        <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <div>
+            <div className="text-base font-semibold text-slate-800">{t.profileTitle}</div>
+            <div className="text-xs text-slate-500 mt-1">{t.profileHint}</div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-slate-400 hover:text-slate-700 text-xl leading-none"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="px-5 py-4 space-y-4">
+          {loading ? (
+            <div className="text-sm text-slate-500">{t.loadingProfile}</div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">{t.age}</label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={form.age}
+                    onChange={e => onChange({ age: e.target.value })}
+                    placeholder={t.agePlaceholder}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">{t.gender}</label>
+                  <input
+                    type="text"
+                    value={form.gender}
+                    onChange={e => onChange({ gender: e.target.value })}
+                    placeholder={t.genderPlaceholder}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">{t.height}</label>
+                  <input
+                    type="number"
+                    value={form.height_cm}
+                    onChange={e => onChange({ height_cm: e.target.value })}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">{t.weight}</label>
+                  <input
+                    type="number"
+                    value={form.weight_kg}
+                    onChange={e => onChange({ weight_kg: e.target.value })}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">{t.chronicDiseases}</label>
+                <textarea
+                  value={form.chronic_diseases}
+                  onChange={e => onChange({ chronic_diseases: e.target.value })}
+                  placeholder={t.chronicDiseasesPlaceholder}
+                  className="w-full min-h-[88px] rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none resize-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">{t.allergies}</label>
+                <textarea
+                  value={form.allergies}
+                  onChange={e => onChange({ allergies: e.target.value })}
+                  placeholder={t.allergiesPlaceholder}
+                  className="w-full min-h-[88px] rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none resize-none focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400"
+                />
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="px-5 py-4 border-t border-slate-100 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-sm rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+            disabled={saving}
+          >
+            {t.cancel}
+          </button>
+
+          <button
+            type="button"
+            onClick={onSave}
+            className="px-4 py-2 text-sm rounded-xl bg-emerald-500 text-white hover:bg-emerald-600 disabled:opacity-50"
+            disabled={loading || saving}
+          >
+            {saving ? '...' : t.save}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function ChatBubble({ msg, doctorWantsMore }: { msg: ChatMessage; doctorWantsMore: string }) {
   const isUser = msg.role === 'user';

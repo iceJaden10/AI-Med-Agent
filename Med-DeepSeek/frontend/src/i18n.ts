@@ -1,5 +1,3 @@
-// src/i18n.ts
-
 export type Lang = 'zh' | 'en';
 
 export const I18N = {
@@ -24,6 +22,25 @@ export const I18N = {
     send: '发送',
     replace: '替换',
     remove: '移除',
+
+    myInfo: '我的信息',
+    profileTitle: '我的信息',
+    save: '保存',
+    cancel: '取消',
+    profileSaved: '用户信息已保存',
+    profileSaveFailed: '保存失败，请稍后重试',
+    loadingProfile: '正在加载用户信息...',
+    age: '年龄',
+    agePlaceholder: '例如：28',
+    gender: '性别',
+    genderPlaceholder: '例如：男 / 女',
+    height: '身高（cm）',
+    weight: '体重（kg）',
+    chronicDiseases: '慢性病史',
+    chronicDiseasesPlaceholder: '多个项目请用逗号分隔，例如：高血压, 糖尿病',
+    allergies: '过敏史',
+    allergiesPlaceholder: '多个项目请用逗号分隔，例如：青霉素, 海鲜',
+    profileHint: '这些信息会作为问诊参考，帮助系统给出更准确的建议。',
 
     uploadOnlyImage: '仅支持上传图片文件',
     uploadTooLarge: '图片过大，请压缩到 8MB 以内',
@@ -81,6 +98,25 @@ export const I18N = {
     send: 'Send',
     replace: 'Replace',
     remove: 'Remove',
+
+    myInfo: 'My Info',
+    profileTitle: 'My Information',
+    save: 'Save',
+    cancel: 'Cancel',
+    profileSaved: 'Profile saved',
+    profileSaveFailed: 'Failed to save profile. Please try again later.',
+    loadingProfile: 'Loading profile...',
+    age: 'Age',
+    agePlaceholder: 'e.g. 28',
+    gender: 'Gender',
+    genderPlaceholder: 'e.g. Male / Female',
+    height: 'Height (cm)',
+    weight: 'Weight (kg)',
+    chronicDiseases: 'Chronic conditions',
+    chronicDiseasesPlaceholder: 'Separate multiple items with commas, e.g. hypertension, diabetes',
+    allergies: 'Allergies',
+    allergiesPlaceholder: 'Separate multiple items with commas, e.g. penicillin, seafood',
+    profileHint: 'These details will be used as triage context to improve relevance.',
 
     uploadOnlyImage: 'Only image files are supported',
     uploadTooLarge: 'Image too large. Please compress to under 8MB',

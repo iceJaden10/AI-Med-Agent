@@ -8,11 +8,13 @@ from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response as FastAPIResponse
+from sqlalchemy import inspect as sa_inspect, text
+from sqlalchemy.orm import Session
 
 from dotenv import load_dotenv
 
-from db import engine, Base
-import models  # noqa: F401  确保 ORM 模型注册到 Base
+from db import engine, Base, SessionLocal
+import models
 from session_store import SQLiteSessionStore
 
 from llm_router import chat_with_llm
@@ -28,8 +30,6 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-# CORS（生产建议用环境变量控制）
-# 例：ALLOW_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
 import os
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
 ALLOW_ORIGINS_LIST = ["*"] if ALLOW_ORIGINS.strip() == "*" else [x.strip() for x in ALLOW_ORIGINS.split(",") if x.strip()]
@@ -42,7 +42,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Prompts
 PROMPT_ZH_PATH = BASE_DIR / "system_prompt_medical_zh.txt"
 PROMPT_EN_PATH = BASE_DIR / "system_prompt_medical_en.txt"
 
@@ -52,13 +51,35 @@ if not PROMPT_ZH_PATH.exists():
 SYSTEM_PROMPT_ZH = PROMPT_ZH_PATH.read_text(encoding="utf-8")
 SYSTEM_PROMPT_EN = PROMPT_EN_PATH.read_text(encoding="utf-8") if PROMPT_EN_PATH.exists() else SYSTEM_PROMPT_ZH
 
-# DB init
 Base.metadata.create_all(bind=engine)
 
-# Session store
+
+def ensure_user_profiles_schema() -> None:
+    inspector = sa_inspect(engine)
+    if "user_profiles" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("user_profiles")}
+    if "age" in columns:
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE user_profiles ADD COLUMN age INTEGER"))
+
+
+ensure_user_profiles_schema()
+
 session_store = SQLiteSessionStore()
 MAX_HISTORY_TURNS = 10
 RECENT_MESSAGE_LIMIT = 8
+
+
+# =========================
+# DB helper
+# =========================
+
+def get_db() -> Session:
+    return SessionLocal()
 
 
 # =========================
@@ -68,10 +89,17 @@ RECENT_MESSAGE_LIMIT = 8
 class PatientProfile(BaseModel):
     age: Optional[int] = None
     gender: Optional[str] = None
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
     chronic_diseases: Optional[List[str]] = None
     allergies: Optional[List[str]] = None
     medications: Optional[List[str]] = None
     extra: Optional[Dict[str, Any]] = None
+
+
+class PatientProfileUpsertRequest(BaseModel):
+    user_id: str
+    profile: PatientProfile
 
 
 class ChatMessage(BaseModel):
@@ -153,7 +181,6 @@ def load_base_prompt(lang: Literal["zh", "en"]) -> str:
 
 
 def language_strict_rule(lang: Literal["zh", "en"]) -> str:
-    # 再加一道“硬约束”，避免模型跑偏/夹杂
     if lang == "en":
         return (
             "\n[STRICT OUTPUT RULE]\n"
@@ -169,6 +196,65 @@ def language_strict_rule(lang: Literal["zh", "en"]) -> str:
     )
 
 
+def row_to_profile(row: Optional[models.UserProfile]) -> Optional[PatientProfile]:
+    if not row:
+        return None
+
+    try:
+        chronic_diseases = json.loads(row.chronic_diseases_json or "[]")
+        if not isinstance(chronic_diseases, list):
+            chronic_diseases = []
+    except json.JSONDecodeError:
+        chronic_diseases = []
+
+    try:
+        allergies = json.loads(row.allergies_json or "[]")
+        if not isinstance(allergies, list):
+            allergies = []
+    except json.JSONDecodeError:
+        allergies = []
+
+    return PatientProfile(
+        age=row.age,
+        gender=row.gender,
+        height_cm=row.height_cm,
+        weight_kg=row.weight_kg,
+        chronic_diseases=chronic_diseases,
+        allergies=allergies,
+    )
+
+
+def load_profile_from_db(user_id: str) -> Optional[PatientProfile]:
+    db = get_db()
+    try:
+        row = db.query(models.UserProfile).filter_by(user_id=user_id).first()
+        return row_to_profile(row)
+    finally:
+        db.close()
+
+
+def save_profile_to_db(user_id: str, profile: PatientProfile) -> PatientProfile:
+    db = get_db()
+    try:
+        row = db.query(models.UserProfile).filter_by(user_id=user_id).first()
+        if not row:
+            row = models.UserProfile(user_id=user_id)
+            db.add(row)
+
+        row.age = profile.age
+        row.gender = profile.gender
+        row.height_cm = profile.height_cm
+        row.weight_kg = profile.weight_kg
+        row.chronic_diseases_json = json.dumps(profile.chronic_diseases or [], ensure_ascii=False)
+        row.allergies_json = json.dumps(profile.allergies or [], ensure_ascii=False)
+
+        db.commit()
+        db.refresh(row)
+        return row_to_profile(row) or PatientProfile()
+    finally:
+        db.close()
+
+
 def build_system_context(profile: Optional[PatientProfile], session_summary: str, lang: Literal["zh", "en"]) -> str:
     lines: List[str] = [load_base_prompt(lang).strip(), language_strict_rule(lang)]
 
@@ -179,6 +265,10 @@ def build_system_context(profile: Optional[PatientProfile], session_summary: str
                 lines.append(f"- Age: {profile.age}")
             if profile.gender:
                 lines.append(f"- Gender: {profile.gender}")
+            if profile.height_cm is not None:
+                lines.append(f"- Height: {profile.height_cm} cm")
+            if profile.weight_kg is not None:
+                lines.append(f"- Weight: {profile.weight_kg} kg")
             if profile.chronic_diseases:
                 lines.append(f"- Chronic conditions: {', '.join(profile.chronic_diseases)}")
             if profile.allergies:
@@ -188,11 +278,15 @@ def build_system_context(profile: Optional[PatientProfile], session_summary: str
             if profile.extra:
                 lines.append(f"- Extra: {profile.extra}")
         else:
-            lines.append("\n【患者基础信息】:")  # 单独一块
+            lines.append("\n【患者基础信息】:")
             if profile.age is not None:
                 lines.append(f"- 年龄: {profile.age} 岁")
             if profile.gender:
                 lines.append(f"- 性别: {profile.gender}")
+            if profile.height_cm is not None:
+                lines.append(f"- 身高: {profile.height_cm} cm")
+            if profile.weight_kg is not None:
+                lines.append(f"- 体重: {profile.weight_kg} kg")
             if profile.chronic_diseases:
                 lines.append(f"- 慢性疾病: {', '.join(profile.chronic_diseases)}")
             if profile.allergies:
@@ -288,9 +382,41 @@ async def options_consult():
     )
 
 
+@app.get("/api/profile")
+def get_profile(user_id: str, response: Response):
+    response.headers["Access-Control-Allow-Origin"] = "*" if "*" in ALLOW_ORIGINS_LIST else ",".join(ALLOW_ORIGINS_LIST)
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id 不能为空")
+
+    profile = load_profile_from_db(user_id)
+    return {
+        "user_id": user_id,
+        "profile": profile.dict() if profile else None,
+    }
+
+
+@app.post("/api/profile")
+def save_profile(req: PatientProfileUpsertRequest, response: Response):
+    response.headers["Access-Control-Allow-Origin"] = "*" if "*" in ALLOW_ORIGINS_LIST else ",".join(ALLOW_ORIGINS_LIST)
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+
+    if not req.user_id:
+        raise HTTPException(status_code=400, detail="user_id 不能为空")
+
+    saved = save_profile_to_db(req.user_id, req.profile)
+    return {
+        "status": "ok",
+        "user_id": req.user_id,
+        "profile": saved.dict(),
+    }
+
+
 @app.post("/api/consult", response_model=ConsultResponse)
 async def consult(req: ConsultRequest, response: Response):
-    # CORS 头（某些代理/部署环境更稳）
     response.headers["Access-Control-Allow-Origin"] = "*" if "*" in ALLOW_ORIGINS_LIST else ",".join(ALLOW_ORIGINS_LIST)
     response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
@@ -300,24 +426,18 @@ async def consult(req: ConsultRequest, response: Response):
 
     lang = normalize_lang(req.lang)
 
-    # 1) load session
     session = session_store.get_session(req.user_id)
     session_summary: str = session.get("summary", "") or ""
     session_history: List[Dict[str, str]] = session.get("messages", []) or []
 
-    # 2) build system prompt with lang
-    system_content = build_system_context(req.patient_profile, session_summary, lang)
+    stored_profile = load_profile_from_db(req.user_id)
+    effective_profile = req.patient_profile or stored_profile
 
-    # 3) recent history
+    system_content = build_system_context(effective_profile, session_summary, lang)
+
     recent_history = session_history[-RECENT_MESSAGE_LIMIT:] if len(session_history) > RECENT_MESSAGE_LIMIT else session_history
 
-    # 4) image
     image_data_url = build_image_data_url(req.image_base64, req.image_mime_type)
-
-    # 5) call llm_router
-    # 关键点：你之前只把 recent_history 传给 router，system prompt 没进去
-    # 这里把 system 作为 history 第一条塞进去，保证模型遵守语言/JSON 规则
-    router_history = [{"role": "system", "content": system_content}, *recent_history]
 
     try:
         result = chat_with_llm(
@@ -326,7 +446,7 @@ async def consult(req: ConsultRequest, response: Response):
             provider=req.provider,
             image_data_url=image_data_url,
             image_name=req.image_name,
-            system_prompt=system_content, 
+            system_prompt=system_content,
         )
 
         if inspect.isawaitable(result):
@@ -338,17 +458,14 @@ async def consult(req: ConsultRequest, response: Response):
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"调用模型失败: {str(e)}")
 
-    # 6) parse json
     try:
         parsed = json.loads(model_text)
     except json.JSONDecodeError:
         parsed = PARSE_FALLBACK_EN.copy() if lang == "en" else PARSE_FALLBACK_ZH.copy()
 
-    # 7) safety + schema
     parsed = apply_safety_guard(parsed, user_query=req.query, lang=lang)
     parsed = ensure_schema(parsed, lang=lang, session_summary=session_summary)
 
-    # 8) update session
     new_summary: str = parsed.get("context_summary") or session_summary
     new_history = session_history + [
         {"role": "user", "content": req.query},
